@@ -2161,8 +2161,6 @@ static const uint8_t font8x8[96][8] = {
    G3. PIXEL / RECT / TEXT PRIMITIVES (FIXED)
    ─────────────────────────────────────────────────────────────────────────── */
 
-/* 1. We define a backbuffer to stop the flashing */
-static uint8_t gui_backbuffer[320 * 200]; 
 
 /* 2. Modified gfx_pixel to write to the BUFFER, not the screen */
 static inline void gfx_pixel(int x, int y, uint8_t c) {
@@ -2226,7 +2224,7 @@ void gfx_char(int x, int y, char ch, uint8_t fg, uint8_t bg) {
         uint8_t bits = bmp[row];
         for(int col = 0; col < 8; col++) {
             /* 0x80 is the leftmost bit. We shift it right to draw left-to-right. */
-            if(bits & (0x80 >> col)) {
+            if(bits & (1 << col)) {
                 gfx_pixel(x + col, y + row, fg);
             } else if(bg != 0xFF) {
                 gfx_pixel(x + col, y + row, bg);
@@ -2757,14 +2755,10 @@ void tw_key(int id, char k) {
     wm_needs_redraw = true;
 }
 
+static bool gui_running=false;
+
 void open_terminal() {
-    if(tw_win>=0&&wins[tw_win].active) { win_focus=tw_win; wm_needs_redraw=true; return; }
-    /* Init terminal buffer */
-    for(int i=0;i<TERM_ROWS;i++) { tw_lines[i][0]='\0'; }
-    tw_row=0; tw_col=0; tw_input[0]='\0'; tw_input_len=0;
-    tw_win=wm_open("Terminal",10,20,TERM_COLS*8+12,(TERM_ROWS+1)*9+TITLE_H+8,
-                   tw_draw,tw_click,tw_key,C_DKGREEN);
-    tw_print("MPOS Terminal\nType commands below.\n");
+    gui_running = false;
 }
 
 /* ===== FILE MANAGER WINDOW ===== */
@@ -3041,23 +3035,25 @@ void open_sysmon() {
 /* ───────────────────────────────────────────────────────────────────────────
    G8. GUI MAIN LOOP
    ─────────────────────────────────────────────────────────────────────────── */
-static bool gui_running=false;
 
 /* Non-blocking keyboard check (returns 0 if no key ready) */
 char kb_try_read() {
-    /* Uses global keymap_lo / keymap_hi declared in the keyboard driver */
-    if(!(inb(0x64)&1)) return 0;
-    uint8_t sc=inb(0x60);
-    if(sc&0x80) return 0; /* key release */
-    if(sc==0x2A||sc==0x36) { shift_held=!shift_held; return 0; }
-    if(sc<128){
-        char c=shift_held?keymap_hi[sc]:keymap_lo[sc];
-        return c;
+    if(!(inb(0x64) & 1)) return 0;  /* no data */
+    uint8_t sc = inb(0x60);
+    if(sc == 0xE0) { inb(0x60); return 0; } /* consume extended, skip */
+    if(sc & 0x80) return 0;  /* key release, ignore */
+    if(sc == 0x2A || sc == 0x36) { shift_held = true;  return 0; }
+    if(sc == 0x1D) { ctrl_held  = true;  return 0; }
+    if(sc < 128) {
+        char c = shift_held ? keymap_hi[sc] : keymap_lo[sc];
+        return c ? c : 0;
     }
     return 0;
 }
 
 /* --- THE FINAL SECTION OF YOUR KERNEL.C --- */
+
+void kernel_main_text();
 
 void gui_run() {
     gui_running = true;
@@ -3080,24 +3076,26 @@ void gui_run() {
     while(gui_running) {
         mouse_poll();
 
-        char k = kb_try_read();
-        if(k == 27) { gui_running = false; break; }
-        if(k) wm_handle_key(k);
+        if(inb(0x64) & 1) {
+        uint8_t sc = inb(0x60);
+        if(sc == 0x2A || sc == 0x36) shift_held = true;
+        else if(sc == 0xAA || sc == 0xB6) shift_held = false;
+        else if(sc == 0x1D) ctrl_held = true;
+        else if(sc == 0x9D) ctrl_held = false;
+        else if(!(sc & 0x80) && sc < 128) {
+        char c = shift_held ? keymap_hi[sc] : keymap_lo[sc];
+        if(c == 27) { gui_running = false; }
+        else if(c) wm_handle_key(c);
+    }
+}
         
-        wm_handle_mouse();
-
         /* App Opening Logic */
-        if(mouse_clicked) {
-            int hit_win = wm_hit(mouse_x, mouse_y);
-            if(hit_win < 0) {
-                /* Only click icons if we didn't hit a window */
-                desktop_click(mouse_x, mouse_y);
-            } else {
-                /* If we hit a window, make it the focus */
-                win_focus = hit_win;
-            }
-            mouse_clicked = false; // Reset the click
+        if(mouse_clicked && wm_hit(mouse_x, mouse_y) < 0) {
+            desktop_click(mouse_x, mouse_y);
         }
+        wm_handle_mouse();
+        mouse_clicked = false;
+        mouse_released = false;
 
         draw_desktop(); 
         wm_draw_all();
@@ -3110,7 +3108,6 @@ void gui_run() {
 
     cmd_reboot();
 }
-
 /* THE ABSOLUTE END OF THE FILE */
 void kernel_main() {
     kernel_main_text();
