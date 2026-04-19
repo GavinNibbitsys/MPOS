@@ -4,8 +4,8 @@
 A Vibe coded os completely from scratch with too many bugs to count.
 
 ## Password
-The username is root.
-The password is toor
+The username is "root"
+The password is "toor"
 
 ## Gui
 
