@@ -1,6 +1,6 @@
 /*
  * ╔══════════════════════════════════════════════════════════════╗
- * ║              MPOS v6.0 — Advanced Kernel                    ║
+ * ║              MPOS v6.1 — Advanced Kernel                    ║
  * ║                                                              ║
  * ║  Features:                                                   ║
  * ║  • Bump Memory Allocator (malloc/free)                       ║
@@ -16,6 +16,23 @@
  * ║  • Color themes (theme command)                               ║
  * ║  • Boot splash + real CPUID/RTC hardware detection           ║
  * ║  • ACPI shutdown / reboot                                    ║
+ * ╠══════════════════════════════════════════════════════════════╣
+ * ║  v6.1 Bug Fixes:                                             ║
+ * ║  • run .c: strips #include/#define, handles int main() {}    ║
+ * ║  • return; no longer corrupts the file (was writing '\0')    ║
+ * ║  • return <expr>; now supported (not just bare return;)       ║
+ * ║  • .c extension check fixed (was matching any trailing 'c')  ║
+ * ║  • malloc: now handles exact-fit blocks; avoids zero-payload  ║
+ * ║    header fragments with minimum split threshold             ║
+ * ║  • itoa: undefined behaviour on INT_MIN fixed (unsigned cast) ║
+ * ║  • cs_eval: two_char operator detection had wrong precedence  ║
+ * ║  • cs_var_set: name buffer now always null-terminated        ║
+ * ║  • proc_kill: wrong errno ENOENT→ESRCH for missing process   ║
+ * ║  • cmd_ps: now shows per-process uptime (was UNUSED(now))    ║
+ * ║  • cmd_mv: no longer deletes source when dest create fails   ║
+ * ║  • input_string: term_col underflow guard (col 0 backspace)  ║
+ * ║  • input_string: history paste now always null-terminates    ║
+ * ║  • env_set: uses sizeof() instead of magic literal sizes     ║
  * ╚══════════════════════════════════════════════════════════════╝
  */
 
@@ -52,6 +69,28 @@ static int errno = 0;
 #define ENOMEM  12
 #define ENOSPC  28
 #define EPERM   1
+#define ESRCH   3   /* no such process */
+
+/* ── User accounts ── */
+typedef struct { char name[16]; char pass[32]; bool is_root; } UserAcct;
+static UserAcct users[] = {
+    {"root",  "toor", true },
+    {"guest", "guest",false},
+};
+#define NUM_USERS 2
+static int  logged_in_user = -1;   /* index into users[], -1 = nobody */
+static char current_user[16] = ""; /* copy of users[logged_in_user].name */
+static bool is_root = false;
+
+/* ── System identity ── */
+static char sys_hostname[32] = "mpos";
+static char cwd[64]          = "/";   /* current working directory */
+
+/* Forward-declared globals needed by VGA/keyboard before their definition site */
+static char pipe_buf[PIPE_BUF_SIZE];
+static int  pipe_len = 0;
+static bool pipe_mode = false;
+static bool gui_mode  = false;
 
 /* ─────────────────────────────────────────────────────────────────
    2.  HARDWARE PORT I/O
@@ -107,7 +146,9 @@ void get_cpu_brand(char *buf) {
 
 uint32_t get_cpu_max_leaf() {
     uint32_t eax;
-    __asm__ volatile("cpuid":"=a"(eax)::"ebx","ecx","edx");
+    /* Must set EAX=0 before CPUID; without the input constraint EAX is
+       whatever garbage the compiler left in the register — undefined behaviour. */
+    __asm__ volatile("cpuid":"=a"(eax):"a"(0):"ebx","ecx","edx");
     return eax;
 }
 
@@ -129,6 +170,7 @@ void rtc_get(DateTime *dt) {
     dt->month = BCD(rtc_read(0x08));
     dt->year  = BCD(rtc_read(0x09)) + 2000;
 }
+
 
 /* ─────────────────────────────────────────────────────────────────
    4.  VGA TEXT-MODE DRIVER  (80×25)
@@ -173,6 +215,13 @@ void scroll_up() {
 }
 
 void term_putc(char c) {
+    /* In GUI mode never touch VGA text memory — redirect to pipe_buf if active */
+    if(gui_mode) {
+        if(pipe_mode && c != '\r') {
+            if(pipe_len < PIPE_BUF_SIZE-1) { pipe_buf[pipe_len++] = c; pipe_buf[pipe_len] = '\0'; }
+        }
+        return;
+    }
     if(c == '\n') { term_col=0; term_row++; }
     else if(c == '\r') { term_col=0; }
     else if(c == '\t') { term_col = (term_col+8)&~7; }
@@ -194,6 +243,7 @@ void print_col(const char *s, uint8_t color) {
 }
 
 void clear_screen() {
+    if(gui_mode) return;  /* never wipe VGA text memory while in graphics mode */
     for(int i=0;i<VGA_W*VGA_H;i++)
         vga[i] = (uint16_t)' ' | (uint16_t)(0x07<<8);
     term_row=0; term_col=0;
@@ -222,6 +272,15 @@ void strncpy(char *d, const char *s, int n) {
 void strcat(char *d, const char *s) { while(*d) d++; while((*d++=*s++)); }
 char *strchr(const char *s, char c) {
     while(*s){ if(*s==c) return (char*)s; s++; } return NULL;
+}
+char *strrchr(const char *s, char c) {
+    const char *last=NULL;
+    while(*s){ if(*s==c) last=s; s++; } return (char*)last;
+}
+void strncat(char *d, const char *s, int n) {
+    while(*d) d++;
+    while(n-->0&&*s) *d++=*s++;
+    *d='\0';
 }
 /* Case-insensitive compare for short strings */
 int strcasecmp(const char *a, const char *b) {
@@ -252,11 +311,12 @@ int atoi(char *s) {
     return sign*r;
 }
 void itoa(int n, char *s) {
-    int i=0,sign=n<0;
-    if(sign) n=-n;
-    do{ s[i++]='0'+n%10; }while((n/=10)>0);
-    if(sign) s[i++]='-'; s[i]='\0';
-    for(int j=0,k=i-1;j<k;j++,k--){char t=s[j];s[j]=s[k];s[k]=t;}
+    int i = 0, sign = (n < 0);
+    /* Cast to unsigned before negating to avoid UB on INT_MIN */
+    unsigned int u = sign ? (unsigned int)(-(n + 1)) + 1u : (unsigned int)n;
+    do { s[i++] = '0' + (int)(u % 10); } while ((u /= 10) > 0);
+    if(sign) s[i++] = '-'; s[i] = '\0';
+    for(int j=0, k=i-1; j<k; j++, k--) { char t=s[j]; s[j]=s[k]; s[k]=t; }
 }
 void itoh(uint32_t n, char *s) {
     /* Hex string, 8 digits */
@@ -314,15 +374,19 @@ void *malloc(size_t size) {
     size = (size + 7) & ~7; /* align to 8 bytes */
     AllocBlock *cur = heap_head;
     while(cur) {
-        if(cur->free && cur->size >= size + sizeof(AllocBlock)) {
-            /* Split block */
-            AllocBlock *next = (AllocBlock*)((uint8_t*)cur + sizeof(AllocBlock) + size);
-            next->size = cur->size - size - sizeof(AllocBlock);
-            next->free = true;
-            next->next = cur->next;
-            cur->size  = size;
-            cur->free  = false;
-            cur->next  = next;
+        if(cur->free && cur->size >= size) {
+            /* Only split if the leftover is large enough to be a usable block;
+               otherwise hand the entire block to the caller to avoid creating
+               zero-payload header fragments. */
+            if(cur->size >= size + sizeof(AllocBlock) + 8) {
+                AllocBlock *next = (AllocBlock*)((uint8_t*)cur + sizeof(AllocBlock) + size);
+                next->size = cur->size - size - sizeof(AllocBlock);
+                next->free = true;
+                next->next = cur->next;
+                cur->size  = size;
+                cur->next  = next;
+            }
+            cur->free = false;
             errno = 0;
             return (void*)((uint8_t*)cur + sizeof(AllocBlock));
         }
@@ -384,6 +448,8 @@ static bool ctrl_held   = false;
 static bool escape_next = false;
 
 char get_key() {
+    /* In GUI mode we must never block — the GUI has its own event loop */
+    if(gui_mode) return '\n';
     while(1) {
         if(!(inb(0x64) & 1)) continue;
         uint8_t sc = inb(0x60);
@@ -457,12 +523,12 @@ static int env_count = 0;
 void env_set(const char *key, const char *val) {
     for(int i=0;i<env_count;i++) {
         if(strcmp(env[i].key,key)==0){
-            strncpy(env[i].val,val,128); return;
+            strncpy(env[i].val, val, sizeof(env[i].val)-1); return;
         }
     }
     if(env_count<MAX_ENV) {
-        strncpy(env[env_count].key,key,32);
-        strncpy(env[env_count].val,val,128);
+        strncpy(env[env_count].key, key, sizeof(env[env_count].key)-1);
+        strncpy(env[env_count].val, val, sizeof(env[env_count].val)-1);
         env_count++;
     }
 }
@@ -543,7 +609,7 @@ void proc_kill(pid_t pid) {
             return;
         }
     }
-    errno=ENOENT; print("No such process.\n");
+    errno=ESRCH; print("No such process.\n");
 }
 
 void proc_exit(pid_t pid, int code) {
@@ -554,31 +620,34 @@ void proc_exit(pid_t pid, int code) {
 
 void cmd_ps() {
     uint64_t now = rdtsc();
-    print_col("\n PID  STATE    NAME\n", T_HEADER);
-    hline('-', 30);
+    print_col("\n PID  STATE    UPTIME(s)  NAME\n", T_HEADER);
+    hline('-', 40);
     for(int i=0;i<MAX_PROCS;i++) {
         if(proc_table[i].state==PROC_FREE) continue;
         char buf[16];
         itoa(proc_table[i].pid, buf);
-        /* PID padded */
         int pl=strlen(buf); print(" ");
         for(int j=pl;j<4;j++) print(" ");
         print(buf); print("  ");
         if(proc_table[i].state==PROC_RUNNING)  print_col("running  ", T_SUCCESS);
         else                                    print_col("zombie   ", T_ERROR);
+        /* Per-process uptime using same TSC shift trick as cmd_uptime */
+        uint64_t delta = now - proc_table[i].start_tick;
+        uint32_t hi = (uint32_t)(delta >> 32);
+        uint32_t lo = (uint32_t)(delta);
+        uint32_t secs = (hi << 1) | (lo >> 31);
+        itoa(secs, buf);
+        int sl=strlen(buf); for(int j=sl;j<10;j++) print(" ");
+        print(buf); print("  ");
         println(proc_table[i].name);
     }
     print("\n");
-    /* Show uptime in raw TSC cycles (simple) */
-    UNUSED(now);
 }
 
 /* ─────────────────────────────────────────────────────────────────
    11. PIPE BUFFER
    ───────────────────────────────────────────────────────────────── */
-static char pipe_buf[PIPE_BUF_SIZE];
-static int  pipe_len = 0;
-static bool pipe_mode = false;  /* when true, print() writes to pipe_buf */
+/* pipe_buf, pipe_len, pipe_mode, gui_mode declared at top of file */
 
 void pipe_clear()  { pipe_buf[0]='\0'; pipe_len=0; }
 void pipe_write(const char *s) {
@@ -810,7 +879,9 @@ void cmd_cp(const char *src, const char *dst) {
 
 /* mv */
 void cmd_mv(const char *src, const char *dst) {
-    cmd_cp(src, dst);
+    File *f = fs_find(src);
+    if(!f){ println("mv: source not found."); return; }
+    if(!fs_create(dst, f->content)){ println("mv: failed (dest may already exist)."); return; }
     fs_rm(src);
 }
 
@@ -832,20 +903,37 @@ void input_string(char *buffer, int max_len) {
         char c=get_key();
         if(c=='\n') { buffer[i]='\0'; term_putc('\n'); return; }
         else if(c=='\b') {
-            if(i>0){ i--; buffer[i]='\0'; term_col--; term_putc(' '); term_col--; }
+            if(i>0){
+                i--; buffer[i]='\0';
+                if(term_col > 0) term_col--;
+                term_putc(' ');
+                if(term_col > 0) term_col--;
+            }
         }
         else if(c==KEY_UP) {
             /* Erase current input */
-            for(int j=0;j<i;j++){ term_col--; term_putc(' '); term_col--; }
+            for(int j=0;j<i;j++){
+                if(term_col > 0) term_col--;
+                term_putc(' ');
+                if(term_col > 0) term_col--;
+            }
             const char *h=hist_prev(&nav);
-            if(h){ strncpy(buffer,h,max_len-1); i=strlen(buffer); print(buffer); }
-            else i=0;
+            if(h){ strncpy(buffer,h,max_len-1); buffer[max_len-1]='\0'; i=strlen(buffer); print(buffer); }
+            else { buffer[0]='\0'; i=0; }
         }
         else if(c==KEY_DOWN) {
-            for(int j=0;j<i;j++){ term_col--; term_putc(' '); term_col--; }
+            for(int j=0;j<i;j++){
+                if(term_col > 0) term_col--;
+                term_putc(' ');
+                if(term_col > 0) term_col--;
+            }
             const char *h=hist_next(&nav);
-            if(h){ strncpy(buffer,h,max_len-1); i=strlen(buffer); print(buffer); }
+            if(h){ strncpy(buffer,h,max_len-1); buffer[max_len-1]='\0'; i=strlen(buffer); print(buffer); }
             else { buffer[0]='\0'; i=0; nav=0; }
+        }
+        else if(c=='\t') {
+            tab_complete(buffer, &i);
+            buffer[i]='\0';
         }
         else if(c>0&&c<0xF0) {
             if(i<max_len-1){ buffer[i++]=c; buffer[i]='\0'; term_putc(c); }
@@ -869,7 +957,11 @@ int cs_var_get(const char *name) {
 }
 void cs_var_set(const char *name, int val) {
     for(int i=0;i<cs_var_count;i++) { if(strcmp(cs_vars[i].name,name)==0){cs_vars[i].val=val;return;} }
-    if(cs_var_count<CS_MAX_VARS){ strncpy(cs_vars[cs_var_count].name,name,16); cs_vars[cs_var_count++].val=val; }
+    if(cs_var_count<CS_MAX_VARS){
+        strncpy(cs_vars[cs_var_count].name, name, sizeof(cs_vars[0].name)-1);
+        cs_vars[cs_var_count].name[sizeof(cs_vars[0].name)-1] = '\0';
+        cs_vars[cs_var_count++].val=val;
+    }
 }
 
 /* Skip whitespace in interpreter cursor */
@@ -907,21 +999,22 @@ int cs_eval(char **p) {
     while(**p=='+'||**p=='-'||**p=='*'||**p=='/'||**p=='%'||
           **p=='='||**p=='!'||**p=='<'||**p=='>') {
         char op1=**p; (*p)++; char op2=**p;
-        bool two_char=(op2=='='||op1=='='&&op2=='=');
+        /* two_char ops: ==, !=, <=, >= */
+        bool two_char = (op2 == '=' && (op1=='='||op1=='!'||op1=='<'||op1=='>'));
         if(two_char) (*p)++;
         cs_skip_ws(p);
         int right=cs_eval_primary(p);
-        if(op1=='+') left=left+right;
-        else if(op1=='-') left=left-right;
-        else if(op1=='*') left=left*right;
-        else if(op1=='/'&&right!=0) left=left/right;
-        else if(op1=='%'&&right!=0) left=left%right;
-        else if(op1=='='&&op2=='=') left=(left==right);
-        else if(op1=='!'&&op2=='=') left=(left!=right);
-        else if(op1=='<'&&op2=='=') left=(left<=right);
-        else if(op1=='>'&&op2=='=') left=(left>=right);
-        else if(op1=='<') left=(left<right);
-        else if(op1=='>') left=(left>right);
+        if     (op1=='+'              ) left=left+right;
+        else if(op1=='-'              ) left=left-right;
+        else if(op1=='*'              ) left=left*right;
+        else if(op1=='/'&&right!=0    ) left=left/right;
+        else if(op1=='%'&&right!=0    ) left=left%right;
+        else if(op1=='='&&op2=='='    ) left=(left==right);
+        else if(op1=='!'&&op2=='='    ) left=(left!=right);
+        else if(op1=='<'&&op2=='='    ) left=(left<=right);
+        else if(op1=='>'&&op2=='='    ) left=(left>=right);
+        else if(op1=='<'              ) left=(left<right);
+        else if(op1=='>'              ) left=(left>right);
         cs_skip_ws(p);
     }
     return left;
@@ -938,6 +1031,9 @@ void cs_skip_block(char **p) {
 }
 
 /* Forward declaration */
+/* CS return flag — set instead of writing '\0' into the file buffer */
+static bool cs_returned = false;
+
 void cs_run_block(char **p, bool execute);
 
 void cs_run_stmt(char **p, bool execute) {
@@ -981,6 +1077,23 @@ void cs_run_stmt(char **p, bool execute) {
         return;
     }
 
+    /* print_num(expr) — print integer without trailing newline */
+    if(strncmp(*p,"print_num(",10)==0) {
+        *p+=10;
+        int val=0;
+        if(execute) val=cs_eval(p); else cs_eval(p);
+        if(**p==')') (*p)++;
+        if(**p==';') (*p)++;
+        if(execute){ char buf[16]; itoa(val,buf); rprint(buf); }
+        return;
+    }
+
+    /* print_nl() — emit a single newline */
+    if(strncmp(*p,"print_nl();",11)==0) {
+        if(execute) rprint("\n");
+        *p+=11; return;
+    }
+
     /* cls(); */
     if(strncmp(*p,"cls();",6)==0) { if(execute) clear_screen(); *p+=6; return; }
 
@@ -1020,8 +1133,15 @@ void cs_run_stmt(char **p, bool execute) {
         *p+=10; return;
     }
 
-    /* return; */
-    if(strncmp(*p,"return;",7)==0) { *p+=7; **p='\0'; return; } /* Signal done */
+    /* return [expr]; — use a flag, never write into the file buffer */
+    if(strncmp(*p,"return",6)==0 &&
+       ((*p)[6]==';'||(*p)[6]==' '||(*p)[6]=='\n'||(*p)[6]=='\0')) {
+        *p+=6; cs_skip_ws(p);
+        if(**p!=';'&&**p!='\n'&&**p!='\0') cs_eval(p); /* consume optional value */
+        if(**p==';') (*p)++;
+        if(execute) cs_returned = true;
+        return;
+    }
 
     /* int varname = expr; */
     if(strncmp(*p,"int ",4)==0) {
@@ -1102,7 +1222,7 @@ void cs_run_stmt(char **p, bool execute) {
 }
 
 void cs_run_block(char **p, bool execute) {
-    while(**p&&**p!='}') {
+    while(**p && **p!='}' && !cs_returned) {
         cs_skip_ws(p);
         if(**p=='\n'){ (*p)++; continue; }
         if(**p=='}') break;
@@ -1116,14 +1236,67 @@ void rprint_char(char c) {
 }
 
 void run_c_script(char *code) {
-    cs_var_count=0;
-    char *p=code;
-    pid_t pid=proc_spawn("c-script");
-    print_col("--- C-Script v2 ---\n", T_HEADER);
+    cs_var_count = 0;
+    cs_returned  = false;
+
+    /* Make a working copy so we never modify the file on disk */
+    static char cs_work[FILE_SIZE];
+    strncpy(cs_work, code, FILE_SIZE-1);
+    cs_work[FILE_SIZE-1] = '\0';
+
+    char *p = cs_work;
+
+    /* Pre-pass: strip lines that real C has but C-Script can't handle.
+       Replace each such line with spaces so pointer arithmetic stays valid. */
+    char *scan = cs_work;
+    while(*scan) {
+        char *line_start = scan;
+        /* Skip leading whitespace to check directive */
+        while(*scan == ' ' || *scan == '\t') scan++;
+        bool is_directive = (strncmp(scan,"#include",8)==0 ||
+                             strncmp(scan,"#define",7)==0  ||
+                             strncmp(scan,"#pragma",7)==0);
+        /* Also skip lines that are only a function signature like:
+           "int main()" / "void main()" — we handle entry below    */
+        bool is_main_sig = (strncmp(scan,"int main",8)==0 ||
+                            strncmp(scan,"void main",9)==0);
+        /* Walk to end of line */
+        while(*scan && *scan != '\n') scan++;
+        if(is_directive) {
+            /* Blank it out */
+            for(char *c=line_start; c<scan; c++) *c=' ';
+        }
+        (void)is_main_sig; /* handled below */
+        if(*scan == '\n') scan++;
+    }
+
+    /* If file contains a main() function, jump into its body */
+    char *main_pos = strstr(cs_work, "main");
+    if(main_pos) {
+        /* Find the opening brace of main's body */
+        char *brace = main_pos;
+        while(*brace && *brace != '{') brace++;
+        if(*brace == '{') {
+            brace++; /* step past '{' */
+            cs_run_block(&brace, true);
+            goto done;
+        }
+    }
+
+    /* No main() — treat entire file as a top-level block */
     cs_run_block(&p, true);
+
+done:
+    cs_returned = false;
+    term_color = T_NORMAL;
+}
+
+static void run_c_script_named(File *f) {
+    pid_t pid = proc_spawn("c-script");
+    print_col("--- C-Script v2 ---\n", T_HEADER);
+    run_c_script(f->content);
     print_col("--- Done ---\n", T_HEADER);
     proc_exit(pid, 0);
-    term_color=T_NORMAL;
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -1553,43 +1726,8 @@ void cmd_theme(const char *arg) {
 /* ─────────────────────────────────────────────────────────────────
    19. HELP SCREEN
    ───────────────────────────────────────────────────────────────── */
-void cmd_help() {
-    print_col("\n MPOS v6.0 — Command Reference\n", T_HEADER);
-    hline('=', 40);
-    print_col(" FILE SYSTEM\n", T_ACCENT);
-    println("  ls [-l]           List files");
-    println("  cat <file>        Print file");
-    println("  nano <file>       Edit file");
-    println("  rm <file>         Delete file");
-    println("  cp <src> <dst>    Copy file");
-    println("  mv <src> <dst>    Move/rename");
-    println("  chmod <perms> <f> e.g. chmod rwx file");
-    println("  wc <file>         Word/line/byte count");
-    println("  grep <pat> <file> Search pattern");
-    println("  hexdump <file>    Hex dump");
-    print_col(" PROCESSES\n", T_ACCENT);
-    println("  ps                Process list");
-    println("  kill <pid>        Kill process");
-    print_col(" SHELL\n", T_ACCENT);
-    println("  echo <text>       Print text");
-    println("  env               Show env vars");
-    println("  set VAR=val       Set env var");
-    println("  history           Show history");
-    println("  cls               Clear screen");
-    print_col(" SCRIPTS\n", T_ACCENT);
-    println("  run <file>        Run .c or .tiny");
-    print_col(" SYSTEM\n", T_ACCENT);
-    println("  sysinfo           Hardware info");
-    println("  uptime            System uptime");
-    println("  theme [0-4]       Color theme");
-    println("  shutdown          Power off");
-    println("  reboot            Restart");
-    print_col(" APPS\n", T_ACCENT);
-    println("  calc              Calculator");
-    println("  ttt               Tic Tac Toe");
-    println("  | (pipe)          cmd1 | cmd2");
-    print("\n");
-}
+/* cmd_help defined later in section 22b alongside all new commands */
+void cmd_help(void);
 
 /* ─────────────────────────────────────────────────────────────────
    20. BOOT SPLASH
@@ -1691,6 +1829,291 @@ void load_demo_files() {
         "EXIT\n"
     );
 
+    /* ── App Library ─────────────────────────────────────────── */
+
+    fs_create("fibonacci.c",
+        "color(cyan);\n"
+        "print(\"=== Fibonacci Sequence ===\");\n"
+        "int a = 0;\n"
+        "int b = 1;\n"
+        "int tmp = 0;\n"
+        "int i = 0;\n"
+        "while(i < 18) {\n"
+        "  printv(a);\n"
+        "  tmp = b;\n"
+        "  b = a + b;\n"
+        "  a = tmp;\n"
+        "  i = i + 1;\n"
+        "}\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("primes.c",
+        "color(yellow);\n"
+        "print(\"=== Primes up to 80 ===\");\n"
+        "int n = 2;\n"
+        "while(n <= 80) {\n"
+        "  int is_prime = 1;\n"
+        "  int d = 2;\n"
+        "  while(d * d <= n) {\n"
+        "    if(n % d == 0) {\n"
+        "      is_prime = 0;\n"
+        "    }\n"
+        "    d = d + 1;\n"
+        "  }\n"
+        "  if(is_prime == 1) {\n"
+        "    printv(n);\n"
+        "  }\n"
+        "  n = n + 1;\n"
+        "}\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("fizzbuzz.c",
+        "color(green);\n"
+        "print(\"=== FizzBuzz 1-30 ===\");\n"
+        "int i = 1;\n"
+        "while(i <= 30) {\n"
+        "  int m3 = i % 3;\n"
+        "  int m5 = i % 5;\n"
+        "  if(m3 == 0) {\n"
+        "    if(m5 == 0) {\n"
+        "      print(\"FizzBuzz\");\n"
+        "    } else {\n"
+        "      print(\"Fizz\");\n"
+        "    }\n"
+        "  } else {\n"
+        "    if(m5 == 0) {\n"
+        "      print(\"Buzz\");\n"
+        "    } else {\n"
+        "      printv(i);\n"
+        "    }\n"
+        "  }\n"
+        "  i = i + 1;\n"
+        "}\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("times.c",
+        "color(cyan);\n"
+        "print(\"=== Times Tables 1-10 ===\");\n"
+        "int row = 1;\n"
+        "while(row <= 10) {\n"
+        "  printv(row * 1);\n"
+        "  printv(row * 2);\n"
+        "  printv(row * 3);\n"
+        "  printv(row * 5);\n"
+        "  printv(row * 10);\n"
+        "  print(\"---\");\n"
+        "  row = row + 1;\n"
+        "}\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("countdown.c",
+        "color(red);\n"
+        "print(\"=== Countdown ===\");\n"
+        "int n = 10;\n"
+        "while(n > 0) {\n"
+        "  printv(n);\n"
+        "  n = n - 1;\n"
+        "}\n"
+        "color(green);\n"
+        "print(\"LIFTOFF!\");\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("squares.c",
+        "color(magenta);\n"
+        "print(\"=== Perfect Squares ===\");\n"
+        "int i = 1;\n"
+        "while(i <= 15) {\n"
+        "  printv(i * i);\n"
+        "  i = i + 1;\n"
+        "}\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("powers2.c",
+        "color(blue);\n"
+        "print(\"=== Powers of 2 ===\");\n"
+        "int p = 1;\n"
+        "int i = 0;\n"
+        "while(i < 16) {\n"
+        "  printv(p);\n"
+        "  p = p * 2;\n"
+        "  i = i + 1;\n"
+        "}\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("collatz.c",
+        "color(yellow);\n"
+        "print(\"=== Collatz Sequence (n=27) ===\");\n"
+        "int n = 27;\n"
+        "int steps = 0;\n"
+        "while(n != 1) {\n"
+        "  printv(n);\n"
+        "  if(n % 2 == 0) {\n"
+        "    n = n / 2;\n"
+        "  } else {\n"
+        "    n = n * 3 + 1;\n"
+        "  }\n"
+        "  steps = steps + 1;\n"
+        "}\n"
+        "print(\"Reached 1 in steps:\");\n"
+        "printv(steps);\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("sysinfo2.c",
+        "color(green);\n"
+        "print(\"=== System Information ===\");\n"
+        "sysinfo();\n"
+        "color(cyan);\n"
+        "print(\"OS: MPOS v6.1\");\n"
+        "print(\"Kernel: C freestanding\");\n"
+        "print(\"Display: VGA 320x200\");\n"
+        "print(\"FS: RAM 32x4KB\");\n"
+        "print(\"Scripting: C-Script v2\");\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("rainbow.c",
+        "print(\"=== Color Showcase ===\");\n"
+        "color(red);\n"
+        "print(\"Red   - danger zone\");\n"
+        "color(yellow);\n"
+        "print(\"Yellow - caution ahead\");\n"
+        "color(green);\n"
+        "print(\"Green  - all systems go\");\n"
+        "color(cyan);\n"
+        "print(\"Cyan   - cool and calm\");\n"
+        "color(blue);\n"
+        "print(\"Blue   - deep waters\");\n"
+        "color(magenta);\n"
+        "print(\"Magenta - electric dreams\");\n"
+        "color(white);\n"
+        "print(\"White  - pure light\");\n"
+        "color(grey);\n"
+        "print(\"Grey   - shadow mode\");\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("triangles.c",
+        "color(cyan);\n"
+        "print(\"=== Number Triangle ===\");\n"
+        "int row = 1;\n"
+        "while(row <= 9) {\n"
+        "  int col = 1;\n"
+        "  int line = 0;\n"
+        "  while(col <= row) {\n"
+        "    line = line * 10 + col;\n"
+        "    col = col + 1;\n"
+        "  }\n"
+        "  printv(line);\n"
+        "  row = row + 1;\n"
+        "}\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("factors.c",
+        "color(yellow);\n"
+        "print(\"=== Factors of 360 ===\");\n"
+        "int n = 360;\n"
+        "int i = 1;\n"
+        "int count = 0;\n"
+        "while(i <= n) {\n"
+        "  if(n % i == 0) {\n"
+        "    printv(i);\n"
+        "    count = count + 1;\n"
+        "  }\n"
+        "  i = i + 1;\n"
+        "}\n"
+        "print(\"Total factors:\");\n"
+        "printv(count);\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("gcd.c",
+        "color(green);\n"
+        "print(\"=== GCD: 1071 and 462 ===\");\n"
+        "int a = 1071;\n"
+        "int b = 462;\n"
+        "int tmp = 0;\n"
+        "while(b != 0) {\n"
+        "  tmp = b;\n"
+        "  b = a % b;\n"
+        "  a = tmp;\n"
+        "}\n"
+        "print(\"GCD result:\");\n"
+        "printv(a);\n"
+        "print(\"Verification: 1071/21 = 51, 462/21 = 22\");\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("guess.c",
+        "color(cyan);\n"
+        "print(\"=== Secret Number Game ===\");\n"
+        "print(\"The secret number is...\");\n"
+        "int secret = 42;\n"
+        "int clue1 = secret / 6;\n"
+        "int clue2 = secret - 40;\n"
+        "print(\"Clue 1: secret / 6 =>\");\n"
+        "printv(clue1);\n"
+        "print(\"Clue 2: secret - 40 =>\");\n"
+        "printv(clue2);\n"
+        "print(\"Clue 3: it is divisible by 6 and 7\");\n"
+        "print(\"Answer:\");\n"
+        "printv(secret);\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
+    fs_create("bubblesort.c",
+        "color(yellow);\n"
+        "print(\"=== Bubble Sort Demo ===\");\n"
+        "int a = 64;\n"
+        "int b = 34;\n"
+        "int c = 25;\n"
+        "int d = 12;\n"
+        "int e = 22;\n"
+        "int f = 11;\n"
+        "int g = 90;\n"
+        "print(\"Before:\");\n"
+        "printv(a); printv(b); printv(c); printv(d);\n"
+        "printv(e); printv(f); printv(g);\n"
+        "int tmp = 0;\n"
+        "int pass = 0;\n"
+        "while(pass < 6) {\n"
+        "  if(a > b) { tmp=a; a=b; b=tmp; }\n"
+        "  if(b > c) { tmp=b; b=c; c=tmp; }\n"
+        "  if(c > d) { tmp=c; c=d; d=tmp; }\n"
+        "  if(d > e) { tmp=d; d=e; e=tmp; }\n"
+        "  if(e > f) { tmp=e; e=f; f=tmp; }\n"
+        "  if(f > g) { tmp=f; f=g; g=tmp; }\n"
+        "  pass = pass + 1;\n"
+        "}\n"
+        "print(\"After:\");\n"
+        "printv(a); printv(b); printv(c); printv(d);\n"
+        "printv(e); printv(f); printv(g);\n"
+        "color(white);\n"
+        "wait();\n"
+    );
+
     /* Simple text file */
     fs_create("readme.txt",
         "Welcome to MPOS v6.0!\n\n"
@@ -1713,6 +2136,16 @@ void load_demo_files() {
 int last_exit_code = 0;
 
 void gui_run();
+void open_apps();
+
+/* Forward declarations for commands defined later in section 22b */
+void tab_complete(char *buf, int *len);
+void cmd_date(void); void cmd_df(void); void cmd_free(void); void cmd_top(void);
+void cmd_whoami(void); void cmd_hostname(const char *arg); void cmd_touch(const char *name);
+void cmd_head(const char *name, int n); void cmd_tail(const char *name, int n);
+void cmd_find(const char *pat); void cmd_mkdir(const char *name);
+void cmd_cd(const char *arg); void cmd_pwd(void); void cmd_passwd(void);
+void cmd_motd(void); void cmd_man(const char *topic); void cmd_help(void);
 
 void dispatch(char *raw_input) {
     /* Expand environment variables */
@@ -1831,6 +2264,22 @@ void dispatch(char *raw_input) {
         print("\n"); last_exit_code=0;
     }
     else if(strcmp(verb,"sysinfo")==0)  { cmd_sysinfo(); last_exit_code=0; }
+    else if(strcmp(verb,"date")==0)     { cmd_date(); last_exit_code=0; }
+    else if(strcmp(verb,"df")==0)       { cmd_df(); last_exit_code=0; }
+    else if(strcmp(verb,"free")==0)     { cmd_free(); last_exit_code=0; }
+    else if(strcmp(verb,"top")==0)      { cmd_top(); last_exit_code=0; }
+    else if(strcmp(verb,"whoami")==0)   { cmd_whoami(); last_exit_code=0; }
+    else if(strcmp(verb,"hostname")==0) { cmd_hostname(argc>1?argv[1]:NULL); last_exit_code=0; }
+    else if(strcmp(verb,"touch")==0)    { if(argc>1)cmd_touch(argv[1]); last_exit_code=0; }
+    else if(strcmp(verb,"head")==0)     { if(argc>1)cmd_head(argv[1],argc>2?atoi(argv[2]):10); last_exit_code=0; }
+    else if(strcmp(verb,"tail")==0)     { if(argc>1)cmd_tail(argv[1],argc>2?atoi(argv[2]):10); last_exit_code=0; }
+    else if(strcmp(verb,"find")==0)     { cmd_find(argc>1?argv[1]:NULL); last_exit_code=0; }
+    else if(strcmp(verb,"mkdir")==0)    { if(argc>1)cmd_mkdir(argv[1]); last_exit_code=0; }
+    else if(strcmp(verb,"cd")==0)       { cmd_cd(argc>1?argv[1]:NULL); last_exit_code=0; }
+    else if(strcmp(verb,"pwd")==0)      { cmd_pwd(); last_exit_code=0; }
+    else if(strcmp(verb,"passwd")==0)   { cmd_passwd(); last_exit_code=0; }
+    else if(strcmp(verb,"motd")==0)     { cmd_motd(); last_exit_code=0; }
+    else if(strcmp(verb,"man")==0)      { cmd_man(argc>1?argv[1]:NULL); last_exit_code=0; }
     else if(strcmp(verb,"uptime")==0)   { cmd_uptime(); last_exit_code=0; }
     else if(strcmp(verb,"theme")==0)    { cmd_theme(argc>1?argv[1]:NULL); last_exit_code=0; }
     else if(strcmp(verb,"calc")==0)     { app_calc(); last_exit_code=0; }
@@ -1843,9 +2292,11 @@ void dispatch(char *raw_input) {
         if(!f){ println("run: file not found."); last_exit_code=1; return; }
         if(!(f->perms&PERM_X)){ println("run: not executable (chmod x)."); last_exit_code=1; return; }
         int nl=strlen(argv[1]);
-        if(argv[1][nl-1]=='c')                       run_c_script(f->content);
-        else if(strncmp(argv[1]+nl-5,".tiny",5)==0)  run_tiny_script(f->content);
-        else println("run: unknown file type.");
+        if(nl>=2 && argv[1][nl-2]=='.' && argv[1][nl-1]=='c')
+            run_c_script_named(f);
+        else if(nl>=5 && strncmp(argv[1]+nl-5,".tiny",5)==0)
+            run_tiny_script(f->content);
+        else println("run: unknown file type (expected .c or .tiny).");
         last_exit_code=0;
     }
     else if(strcmp(verb,"gui")==0) {
@@ -1863,6 +2314,391 @@ void dispatch(char *raw_input) {
 /* ─────────────────────────────────────────────────────────────────
    23. KERNEL ENTRY POINT
    ───────────────────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────
+   22b. BOOT SEQUENCE, LOGIN, AND NEW COMMANDS
+   ───────────────────────────────────────────────────────────────── */
+
+/* Read a password — prints * for each character */
+void input_password(char *buf, int max) {
+    int i=0; buf[0]='\0';
+    while(1){
+        char c=get_key();
+        if(c=='\n'){ buf[i]='\0'; term_putc('\n'); return; }
+        if(c=='\b'&&i>0){ i--; buf[i]='\0'; term_col--; term_putc(' '); term_col--; }
+        else if(c>=' '&&c<127&&i<max-1){ buf[i++]=c; buf[i]='\0'; term_putc('*'); }
+    }
+}
+
+/* Tab completion helper — called from input_string on TAB key */
+static const char *cmd_list[] = {
+    "ls","cat","echo","rm","cp","mv","mkdir","cd","pwd","touch",
+    "nano","run","grep","wc","hexdump","chmod","find","head","tail",
+    "ps","kill","date","df","free","top","whoami","hostname","passwd",
+    "man","history","env","set","sysinfo","uptime","calc","ttt",
+    "theme","clear","cls","gui","reboot","shutdown","motd",NULL
+};
+
+void tab_complete(char *buf, int *len) {
+    if(*len==0) return;
+    /* Find start of last word */
+    char *word=buf;
+    for(int i=0;i<*len;i++) if(buf[i]==' ') word=buf+i+1;
+    int wlen=(int)(buf+*len-word);
+    if(wlen==0) return;
+    bool after_space=(word!=buf);
+
+    /* Collect matches */
+    const char *matches[32]; int nm=0;
+    if(!after_space){
+        /* Complete command */
+        for(int i=0;cmd_list[i]&&nm<32;i++)
+            if(strncmp(cmd_list[i],word,wlen)==0) matches[nm++]=cmd_list[i];
+    } else {
+        /* Complete filename */
+        for(int i=0;i<MAX_FILES&&nm<32;i++)
+            if(fs[i].active&&strncmp(fs[i].name,word,wlen)==0) matches[nm++]=fs[i].name;
+    }
+    if(nm==0) return;
+    if(nm==1){
+        /* Unique match — complete it */
+        const char *m=matches[0];
+        int ml=strlen(m);
+        for(int i=wlen;i<ml;i++){
+            buf[*len]=m[i]; (*len)++; term_putc(m[i]);
+        }
+        buf[*len]=' '; (*len)++; term_putc(' ');
+        buf[*len]='\0';
+    } else {
+        /* Show all matches on new line */
+        term_putc('\n');
+        for(int i=0;i<nm;i++){ print(matches[i]); print("  "); }
+        term_putc('\n');
+        /* Reprint prompt + current input */
+        print_col(current_user, T_SUCCESS); print("@");
+        print_col(sys_hostname, T_ACCENT); print(":");
+        print_col(cwd, T_HEADER); print(is_root?"# ":"$ ");
+        print(buf);
+    }
+}
+
+/* ── Boot message sequence ── */
+void boot_messages(void) {
+    clear_screen();
+    term_color=0x0A;
+    println("MPOS v6.1 — Multi-Purpose Operating System");
+    term_color=0x07;
+    println("──────────────────────────────────────────");
+
+    /* CPU detection */
+    char vendor[13], brand[49];
+    get_cpu_vendor(vendor); get_cpu_brand(brand);
+    print_col("[  OK  ] ", 0x0A); print("CPU: "); print(vendor); print(" — "); println(brand);
+
+    /* Memory */
+    char mbuf[16]; itoa(HEAP_SIZE/1024, mbuf);
+    print_col("[  OK  ] ", 0x0A); print("Memory: "); print(mbuf); println(" KB heap initialised");
+
+    /* Filesystem */
+    print_col("[  OK  ] ", 0x0A); println("RAM filesystem mounted (32 files × 4 KB)");
+
+    /* RTC */
+    DateTime dt; rtc_get(&dt);
+    char yr[8],mo[4],dy[4],hr[4],mn[4],sc[4];
+    itoa(dt.year,yr); itoa(dt.month,mo); itoa(dt.day,dy);
+    itoa(dt.hour,hr); itoa(dt.min,mn);   itoa(dt.sec,sc);
+    print_col("[  OK  ] ", 0x0A);
+    print("RTC: "); print(yr); print("-");
+    if(dt.month<10)print("0"); print(mo); print("-");
+    if(dt.day<10)print("0");   print(dy); print("  ");
+    if(dt.hour<10)print("0");  print(hr); print(":");
+    if(dt.min<10)print("0");   print(mn); print(":");
+    if(dt.sec<10)print("0");   println(sc);
+
+    /* Keyboard */
+    print_col("[  OK  ] ", 0x0A); println("PS/2 keyboard driver loaded");
+
+    /* VGA */
+    print_col("[  OK  ] ", 0x0A); println("VGA 80×25 text mode active");
+
+    print_col("[  OK  ] ", 0x0A); println("All systems nominal");
+    println("");
+    term_color=0x0F;
+    println("MPOS v6.1 (c) 2025  Type 'help' for commands, 'gui' for desktop");
+    println("");
+}
+
+/* ── Login screen ── */
+bool do_login(void) {
+    char uname[16], upass[32];
+    for(int tries=0;tries<3;tries++){
+        term_color=0x0F; print("login: "); term_color=0x0A;
+        input_string(uname,sizeof(uname));
+        term_color=0x0F; print("password: ");
+        input_password(upass,sizeof(upass));
+        for(int i=0;i<NUM_USERS;i++){
+            if(strcmp(users[i].name,uname)==0 && strcmp(users[i].pass,upass)==0){
+                logged_in_user=i;
+                strncpy(current_user,users[i].name,sizeof(current_user)-1);
+                is_root=users[i].is_root;
+                /* Set cwd */
+                if(is_root) strncpy(cwd,"/root",sizeof(cwd)-1);
+                else{ strncpy(cwd,"/home/",sizeof(cwd)-1); strcat(cwd,current_user); }
+                env_set("USER",current_user);
+                env_set("HOME",cwd);
+                return true;
+            }
+        }
+        term_color=0x0C; println("Login incorrect.\n"); term_color=0x0F;
+    }
+    return false;
+}
+
+/* ── New commands ── */
+
+void cmd_date(void){
+    DateTime dt; rtc_get(&dt);
+    char y[8],mo[4],d[4],h[4],mn[4],s[4];
+    itoa(dt.year,y);itoa(dt.month,mo);itoa(dt.day,d);
+    itoa(dt.hour,h);itoa(dt.min,mn);itoa(dt.sec,s);
+    print(y); print("-");
+    if(dt.month<10)print("0"); print(mo); print("-");
+    if(dt.day<10)print("0");   print(d);  print("  ");
+    if(dt.hour<10)print("0");  print(h);  print(":");
+    if(dt.min<10)print("0");   print(mn); print(":");
+    if(dt.sec<10)print("0");   print(s);
+    print("\n");
+}
+
+void cmd_df(void){
+    print_col("\n Filesystem      Files    Used\n",T_HEADER);
+    hline('-',34);
+    char buf[12];
+    int used=0; for(int i=0;i<MAX_FILES;i++) if(fs[i].active) used++;
+    print(" ramfs        "); itoa(MAX_FILES,buf); print("   "); print(buf); print("    ");
+    itoa(used,buf); print(buf); print("\n\n");
+}
+
+void cmd_free(void){
+    size_t total=HEAP_SIZE/1024;
+    size_t free_k=mm_free_bytes()/1024;
+    size_t used_k=total-free_k;
+    char b[16];
+    print_col("\n              total    used    free\n",T_HEADER);
+    hline('-',38);
+    print(" Mem:      ");
+    itoa(total,b); int l=strlen(b); for(int i=l;i<8;i++)print(" "); print(b); print(" KB  ");
+    itoa(used_k,b); l=strlen(b); for(int i=l;i<6;i++)print(" "); print(b); print(" KB  ");
+    itoa(free_k,b); print(b); println(" KB");
+    print("\n");
+}
+
+void cmd_top(void){
+    println("PROCESSES  (press any key to exit)");
+    hline('-',40);
+    uint64_t now=rdtsc();
+    for(int i=0;i<MAX_PROCS;i++){
+        if(proc_table[i].state==PROC_FREE) continue;
+        char pid[8]; itoa(proc_table[i].pid,pid);
+        uint64_t d=now-proc_table[i].start_tick;
+        uint32_t hi=(uint32_t)(d>>32),lo=(uint32_t)d;
+        uint32_t secs=(hi<<1)|(lo>>31);
+        char st[8]; itoa(secs,st);
+        int pl=strlen(pid); print(" "); for(int j=pl;j<4;j++)print(" ");
+        print(pid); print("  ");
+        print_col(proc_table[i].state==PROC_RUNNING?"RUN ":"ZMB ",
+                  proc_table[i].state==PROC_RUNNING?T_SUCCESS:T_ERROR);
+        print(st); print("s  ");
+        println(proc_table[i].name);
+    }
+    get_key();
+}
+
+void cmd_whoami(void){ println(current_user); }
+
+void cmd_hostname(const char *arg){
+    if(!arg||!arg[0]){ println(sys_hostname); return; }
+    if(!is_root){ println("hostname: permission denied (not root)"); return; }
+    strncpy(sys_hostname,arg,sizeof(sys_hostname)-1);
+    env_set("HOSTNAME",sys_hostname);
+    println("Hostname updated.");
+}
+
+void cmd_touch(const char *name){
+    if(!name||!name[0]){ println("Usage: touch <file>"); return; }
+    if(fs_find(name)){ return; }   /* already exists — update would go here */
+    if(!fs_create(name,NULL)) println("touch: cannot create file.");
+}
+
+void cmd_head(const char *name, int n){
+    File *f=fs_find(name);
+    if(!f){ println("head: file not found."); return; }
+    char *p=f->content; int lines=0;
+    while(*p&&lines<n){
+        if(*p=='\n') lines++;
+        term_putc(*p++);
+    }
+    if(*(p-1)!='\n') term_putc('\n');
+}
+
+void cmd_tail(const char *name, int n){
+    File *f=fs_find(name);
+    if(!f){ println("tail: file not found."); return; }
+    int total=0; char *p=f->content;
+    while(*p){ if(*p=='\n') total++; p++; }
+    int skip=total-n; if(skip<0)skip=0;
+    p=f->content; int skipped=0;
+    while(*p&&skipped<skip){ if(*p=='\n')skipped++; p++; }
+    print(p); if(p[strlen(p)-1]!='\n') print("\n");
+}
+
+void cmd_find(const char *pat){
+    bool found=false;
+    for(int i=0;i<MAX_FILES;i++){
+        if(!fs[i].active) continue;
+        if(!pat||pat[0]=='\0'||strstr(fs[i].name,pat)){
+            print("  "); println(fs[i].name); found=true;
+        }
+    }
+    if(!found) println("(no files found)");
+}
+
+void cmd_mkdir(const char *name){
+    if(!name||!name[0]){println("Usage: mkdir <dir>");return;}
+    char dname[36]; strncpy(dname,name,32); strcat(dname,"/");
+    if(fs_find(dname)){ println("mkdir: already exists."); return; }
+    File *f=fs_create(dname,"");
+    if(f){ f->perms=PERM_R|PERM_X; println("Directory created."); }
+    else println("mkdir: failed.");
+}
+
+void cmd_cd(const char *arg){
+    if(!arg||!arg[0]||strcmp(arg,"~")==0||strcmp(arg,"--")==0){
+        /* home */
+        if(is_root) strncpy(cwd,"/root",sizeof(cwd)-1);
+        else{ strncpy(cwd,"/home/",sizeof(cwd)-1); strcat(cwd,current_user); }
+        return;
+    }
+    if(strcmp(arg,"/")==0){ strncpy(cwd,"/",sizeof(cwd)-1); return; }
+    if(strcmp(arg,"..")==0){
+        char *last=strrchr(cwd,'/');
+        if(last&&last!=cwd) *last='\0';
+        else strncpy(cwd,"/",sizeof(cwd)-1);
+        return;
+    }
+    /* Check if directory marker exists */
+    char dname[36]; strncpy(dname,arg,32); strcat(dname,"/");
+    if(!fs_find(dname)&&strcmp(arg,"/")!=0){
+        println("cd: no such directory."); return;
+    }
+    if(arg[0]=='/') strncpy(cwd,arg,sizeof(cwd)-1);
+    else{ strcat(cwd,"/"); strncat(cwd,arg,sizeof(cwd)-strlen(cwd)-1); }
+}
+
+void cmd_pwd(void){ println(cwd); }
+
+void cmd_passwd(void){
+    if(logged_in_user<0) return;
+    char p1[32],p2[32];
+    print("New password: ");   input_password(p1,sizeof(p1));
+    print("Retype password: "); input_password(p2,sizeof(p2));
+    if(strcmp(p1,p2)!=0){ println("Passwords do not match."); return; }
+    strncpy(users[logged_in_user].pass,p1,sizeof(users[0].pass)-1);
+    println("Password updated.");
+}
+
+void cmd_motd(void){
+    File *f=fs_find("motd");
+    if(f) println(f->content);
+}
+
+/* ── man pages ── */
+static const struct { const char *cmd; const char *text; } mandb[]={
+    {"ls",    "ls [-l]\n  List files. -l shows size and permissions."},
+    {"cat",   "cat <file>\n  Print file contents."},
+    {"echo",  "echo <text> [> file]\n  Print text or write to file."},
+    {"rm",    "rm <file>\n  Delete a file."},
+    {"cp",    "cp <src> <dst>\n  Copy a file."},
+    {"mv",    "mv <src> <dst>\n  Move/rename a file."},
+    {"mkdir", "mkdir <name>\n  Create a directory."},
+    {"cd",    "cd [dir]\n  Change directory. cd alone goes home."},
+    {"pwd",   "pwd\n  Print current directory."},
+    {"touch", "touch <file>\n  Create empty file."},
+    {"find",  "find [pattern]\n  Search for files matching pattern."},
+    {"head",  "head <file> [n]\n  Show first n lines (default 10)."},
+    {"tail",  "tail <file> [n]\n  Show last n lines (default 10)."},
+    {"grep",  "grep <pattern> <file>\n  Search for pattern in file."},
+    {"wc",    "wc <file>\n  Count lines, words, bytes."},
+    {"hexdump","hexdump <file>\n  Show file contents in hex."},
+    {"chmod", "chmod <rwx> <file>\n  Change file permissions."},
+    {"nano",  "nano [file]\n  Text editor. ESC=save, Ctrl+Q=quit."},
+    {"run",   "run <file.c|file.tiny>\n  Execute a C-Script or Tiny-Script."},
+    {"ps",    "ps\n  List processes with uptime."},
+    {"kill",  "kill <pid>\n  Terminate a process."},
+    {"date",  "date\n  Show current date and time."},
+    {"df",    "df\n  Show filesystem usage."},
+    {"free",  "free\n  Show memory usage."},
+    {"top",   "top\n  Show live process list. Any key to exit."},
+    {"whoami","whoami\n  Show current username."},
+    {"hostname","hostname [name]\n  Show or set hostname (root only)."},
+    {"passwd","passwd\n  Change your password."},
+    {"uptime","uptime\n  Show system uptime."},
+    {"sysinfo","sysinfo\n  CPU and system information."},
+    {"history","history\n  Show command history."},
+    {"env",   "env\n  Show environment variables."},
+    {"set",   "set VAR=value\n  Set environment variable."},
+    {"theme", "theme [0-4]\n  Change colour theme."},
+    {"gui",   "gui\n  Launch graphical desktop (Mode 13h)."},
+    {"motd",  "motd\n  Show message of the day."},
+    {"reboot","reboot\n  Restart the system."},
+    {"shutdown","shutdown\n  Power off the system."},
+};
+#define MANDB_SIZE ((int)(sizeof(mandb)/sizeof(mandb[0])))
+
+void cmd_man(const char *topic){
+    if(!topic||!topic[0]){
+        println("Usage: man <command>");
+        println("Available topics:");
+        for(int i=0;i<MANDB_SIZE;i++){
+            print("  "); print(mandb[i].cmd);
+            if(i%4==3) print("\n"); else print("\t");
+        }
+        print("\n"); return;
+    }
+    for(int i=0;i<MANDB_SIZE;i++){
+        if(strcmp(mandb[i].cmd,topic)==0){
+            print_col(mandb[i].cmd,T_HEADER); print_col(" — ",T_HEADER);
+            println(""); println(mandb[i].text); println(""); return;
+        }
+    }
+    print("man: no manual entry for '"); print(topic); println("'.");
+}
+
+/* ── Updated help ── */
+void cmd_help(void){
+    print_col("\nMPOS v6.1 Command Reference\n",T_HEADER);
+    hline('-',40);
+    print_col("Files:     ",T_ACCENT);
+    println("ls  cat  echo  rm  cp  mv  touch  find  head  tail  chmod  nano");
+    print_col("Dirs:      ",T_ACCENT);
+    println("cd  pwd  mkdir");
+    print_col("View:      ",T_ACCENT);
+    println("grep  wc  hexdump");
+    print_col("System:    ",T_ACCENT);
+    println("ps  kill  top  free  df  date  uptime  sysinfo  hostname  whoami");
+    print_col("User:      ",T_ACCENT);
+    println("passwd  motd  env  set  history");
+    print_col("Scripts:   ",T_ACCENT);
+    println("run <file.c>   run <file.tiny>   calc   ttt");
+    print_col("Settings:  ",T_ACCENT);
+    println("theme [0-4]");
+    print_col("Desktop:   ",T_ACCENT);
+    println("gui");
+    print_col("Power:     ",T_ACCENT);
+    println("reboot  shutdown");
+    println("\nType 'man <command>' for detailed help on any command.");
+    println("");
+}
+
 void kernel_main_text() {
     disable_cursor();
     mm_init();
@@ -1870,28 +2706,63 @@ void kernel_main_text() {
     proc_init();
 
     /* Default environment */
-    env_set("OS",    "MPOS");
-    env_set("VER",   "6.0");
-    env_set("THEME", "Classic");
+    env_set("OS",      "MPOS");
+    env_set("VER",     "6.1");
+    env_set("HOSTNAME",sys_hostname);
 
     load_demo_files();
-    draw_splash();
+
+    /* Create default directory structure */
+    cmd_mkdir("home");
+    cmd_mkdir("home/root");
+    cmd_mkdir("home/guest");
+    cmd_mkdir("etc");
+    cmd_mkdir("tmp");
+
+    /* /etc/motd */
+    fs_create("motd",
+        "Welcome to MPOS v6.1!\n"
+        "Type 'help' for commands, 'man <cmd>' for details.\n"
+        "Type 'gui' to launch the graphical desktop.\n"
+    );
+
+    /* Boot sequence */
+    boot_messages();
+
+    /* Login */
+    while(!do_login()){
+        term_color=0x0C;
+        println("Maximum login attempts exceeded.");
+        __asm__ volatile("cli; hlt");
+    }
+
+    /* Message of the day */
+    term_color=T_SUCCESS;
+    print("\nWelcome, "); print(current_user); println("!\n");
+    term_color=T_NORMAL;
+    cmd_motd();
+    println("");
 
     char input[HIST_LEN];
     while(1) {
-        /* Prompt: show last exit code if non-zero */
-        if(last_exit_code!=0) {
-            term_color=T_ERROR; print("["); 
+        /* Rich prompt: user@hostname:cwd$ */
+        if(last_exit_code!=0){
+            term_color=T_ERROR; print("[");
             char ec[8]; itoa(last_exit_code,ec); print(ec);
             print("] "); term_color=T_NORMAL;
         }
-        term_color=T_ACCENT; print("MOS"); 
-        term_color=T_NORMAL; print("> ");
-        input_string(input, HIST_LEN);
+        print_col(current_user,T_SUCCESS);
+        print("@"); print_col(sys_hostname,T_ACCENT);
+        print(":"); print_col(cwd,T_HEADER);
+        print(is_root?"# ":"$ ");
+        term_color=T_NORMAL;
+
+        input_string(input,HIST_LEN);
         if(input[0]!='\0') hist_push(input);
         dispatch(input);
     }
 }
+
 
 /* ─────────────────────────────────────────────────────────────────────────────
    GUI LAYER  (appended)
@@ -2324,8 +3195,11 @@ static uint8_t mouse_packet[3];
 static int     mouse_pkt_idx=0;
 
 void mouse_poll() {
-    while(inb(MOUSE_STAT) & 0x21) { /* bit 0=data ready, bit 5=aux */
-        uint8_t data=inb(MOUSE_PORT);
+    while(1) {
+        uint8_t stat = inb(MOUSE_STAT);
+        if(!(stat & 0x01)) break;        /* no data at all */
+        if(!(stat & 0x20)) break;        /* data present but it's keyboard, not mouse — stop */
+        uint8_t data = inb(MOUSE_PORT);
         /* Wait for sync byte: bit 3 must be set */
         if(mouse_pkt_idx==0 && !(data&0x08)) continue;
         mouse_packet[mouse_pkt_idx++]=data;
@@ -2375,6 +3249,9 @@ void cursor_draw(int x, int y) {
 /* ───────────────────────────────────────────────────────────────────────────
    G5. WINDOW MANAGER
    ─────────────────────────────────────────────────────────────────────────── */
+/* Forward declarations for app openers (defined later in G7) */
+void open_terminal();
+void open_editor_with(const char *filename);
 #define MAX_WINS    8
 #define TITLE_H     12  /* title bar height in pixels */
 #define BORDER      2
@@ -2550,11 +3427,11 @@ typedef struct {
     void (*action)();
 } DesktopIcon;
 
-static DesktopIcon icons[8];
+static DesktopIcon icons[10];
 static int icon_count=0;
 
 void icon_add(int x,int y,const char *label, uint8_t color, void(*action)()) {
-    if(icon_count>=8) return;
+    if(icon_count>=10) return;
     icons[icon_count].x=x; icons[icon_count].y=y;
     strncpy(icons[icon_count].label,label,16);
     icons[icon_count].color=color;
@@ -2758,7 +3635,11 @@ void tw_key(int id, char k) {
 static bool gui_running=false;
 
 void open_terminal() {
-    gui_running = false;
+    if(tw_win>=0 && wins[tw_win].active){ win_focus=tw_win; wm_needs_redraw=true; return; }
+    for(int i=0;i<TERM_ROWS;i++){ tw_lines[i][0]='\0'; }
+    tw_row=0; tw_col=0;
+    tw_input[0]='\0'; tw_input_len=0;
+    tw_win=wm_open("Terminal",45,10,240,115,tw_draw,tw_click,tw_key,C_DKGREEN);
 }
 
 /* ===== FILE MANAGER WINDOW ===== */
@@ -2811,17 +3692,16 @@ void fm_click(int id, int lx, int ly) {
     int by=ch-12;
     if(ly>=by&&ly<by+10) {
         if(lx>=2&&lx<32 && fm_selected>=0) {
-            /* Open: show in terminal */
-            open_terminal();
-            tw_print("\n--- "); tw_print(fs[fm_selected].name); tw_print(" ---\n");
-            tw_print(fs[fm_selected].content); tw_print("\n");
+            /* Open: launch text editor with this file */
+            open_editor_with(fs[fm_selected].name);
         }
         if(lx>=35&&lx<65 && fm_selected>=0) {
             if(fs[fm_selected].perms&PERM_X) {
                 open_terminal();
                 int nl=strlen(fs[fm_selected].name);
                 pipe_clear(); pipe_mode=true;
-                if(fs[fm_selected].name[nl-1]=='c') run_c_script(fs[fm_selected].content);
+                if(nl>=2 && fs[fm_selected].name[nl-2]=='.' && fs[fm_selected].name[nl-1]=='c')
+                    run_c_script(fs[fm_selected].content);
                 else run_tiny_script(fs[fm_selected].content);
                 pipe_mode=false;
                 tw_print(pipe_buf);
@@ -2934,6 +3814,264 @@ void open_calculator() {
     calc_win=wm_open("Calculator",200,30,90,80,calc_draw,calc_click,calc_key,C_BROWN);
 }
 
+/* ===== APPS LAUNCHER WINDOW ===== */
+
+typedef struct {
+    const char *display_name;
+    const char *filename;
+    const char *description;
+    uint8_t     icon_color;
+} AppEntry;
+
+/* Catalogue — matches files created in load_demo_files */
+static const AppEntry app_catalog[] = {
+    { "Fibonacci",   "fibonacci.c",  "Fibonacci sequence",    C_CYAN      },
+    { "Primes",      "primes.c",     "Prime numbers to 80",   C_YELLOW    },
+    { "FizzBuzz",    "fizzbuzz.c",   "Classic FizzBuzz 1-30", C_GREEN     },
+    { "Times Table", "times.c",      "Multiplication tables", C_DKCYAN    },
+    { "Countdown",   "countdown.c",  "10..1 countdown!",      C_RED       },
+    { "Squares",     "squares.c",    "Perfect squares",       C_MAGENTA   },
+    { "Powers of 2", "powers2.c",    "Binary powers 0-15",    C_DKBLUE    },
+    { "Collatz",     "collatz.c",    "Collatz: starting n=27",C_YELLOW    },
+    { "Sys Info",    "sysinfo2.c",   "System information",    C_DKGREEN   },
+    { "Rainbow",     "rainbow.c",    "Color showcase",        C_DKRED     },
+    { "Triangles",   "triangles.c",  "Number triangle",       C_CYAN      },
+    { "Factors",     "factors.c",    "Factors of 360",        C_GREEN     },
+    { "GCD",         "gcd.c",        "Euclidean GCD algo",    C_DKGREEN   },
+    { "Guess Game",  "guess.c",      "Secret number puzzle",  C_MAGENTA   },
+    { "Bubble Sort", "bubblesort.c", "Sort 7 numbers",        C_YELLOW    },
+};
+#define APP_COUNT 15
+#define APP_ROW_H  19
+#define APP_VISIBLE 8
+
+static int  apps_win      = -1;
+static int  apps_scroll   =  0;
+static int  apps_selected = -1;
+
+void apps_draw(int id) {
+    Window *w = &wins[id];
+    int cx = w->x + BORDER;
+    int cy = w->y + BORDER + TITLE_H;
+    int cw = w->w - BORDER * 2;
+
+    /* Panel background */
+    gfx_fill(cx, cy, cw, w->h - TITLE_H, C_WINBG);
+
+    /* Column headers */
+    gfx_fill(cx, cy, cw, 11, C_TITLEACT);
+    gfx_str(cx + 20, cy + 2, "App",         C_WHITE, C_TITLEACT);
+    gfx_str(cx + 110, cy + 2, "Description", C_WHITE, C_TITLEACT);
+
+    int ay = cy + 12;
+    for(int i = apps_scroll; i < APP_COUNT && i < apps_scroll + APP_VISIBLE; i++) {
+        bool sel = (i == apps_selected);
+        uint8_t row_bg = sel
+            ? C_SELBG
+            : (i % 2 == 0 ? C_WINBG : rgb_to_pal(205, 205, 218));
+        uint8_t fg     = sel ? C_WHITE : C_TXTDARK;
+        uint8_t dfg    = sel ? rgb_to_pal(180,220,255) : rgb_to_pal(80,80,100);
+
+        gfx_fill(cx, ay, cw, APP_ROW_H - 1, row_bg);
+
+        /* Coloured icon square */
+        gfx_fill(cx + 2, ay + 3, 12, 12, app_catalog[i].icon_color);
+        gfx_rect(cx + 2, ay + 3, 12, 12, sel ? C_WHITE : C_DKGREY);
+
+        /* App name */
+        gfx_str(cx + 18, ay + 5, app_catalog[i].display_name, fg, row_bg);
+
+        /* Description (clipped) */
+        gfx_str_clip(cx + 108, ay + 5, cw - 110, app_catalog[i].description, dfg, row_bg);
+
+        ay += APP_ROW_H;
+    }
+
+    /* ── Scroll bar area ── */
+    int sb_x  = cx + cw - 14;     /* right edge strip */
+    int sb_y0 = cy + 12;
+    int sb_h  = APP_VISIBLE * APP_ROW_H;
+
+    /* Track */
+    gfx_fill(sb_x, sb_y0, 13, sb_h, rgb_to_pal(180,180,200));
+
+    /* Up arrow button */
+    bool can_up   = (apps_scroll > 0);
+    uint8_t arr_bg = can_up ? rgb_to_pal(100,120,200) : rgb_to_pal(150,150,170);
+    gfx_fill(sb_x, sb_y0, 13, 13, arr_bg);
+    gfx_rect(sb_x, sb_y0, 13, 13, C_WHITE);
+    gfx_str(sb_x + 3, sb_y0 + 3, can_up ? "^" : "-", C_WHITE, arr_bg);
+
+    /* Down arrow button */
+    bool can_dn   = (apps_scroll + APP_VISIBLE < APP_COUNT);
+    arr_bg = can_dn ? rgb_to_pal(100,120,200) : rgb_to_pal(150,150,170);
+    gfx_fill(sb_x, sb_y0 + sb_h - 13, 13, 13, arr_bg);
+    gfx_rect(sb_x, sb_y0 + sb_h - 13, 13, 13, C_WHITE);
+    gfx_str(sb_x + 3, sb_y0 + sb_h - 11, can_dn ? "v" : "-", C_WHITE, arr_bg);
+
+    /* Thumb */
+    if(APP_COUNT > APP_VISIBLE) {
+        int track_h = sb_h - 26;
+        int thumb_h = track_h * APP_VISIBLE / APP_COUNT;
+        if(thumb_h < 6) thumb_h = 6;
+        int thumb_y = sb_y0 + 13 + track_h * apps_scroll / APP_COUNT;
+        gfx_fill(sb_x + 2, thumb_y, 9, thumb_h, rgb_to_pal(60,90,180));
+    }
+
+    /* ── Run button ── */
+    int btn_y  = cy + 12 + APP_VISIBLE * APP_ROW_H + 3;
+    bool can_run = (apps_selected >= 0);
+    uint8_t btn_bg = can_run ? C_TITLEACT : rgb_to_pal(130,130,150);
+    int btn_w = 64, btn_h = 13;
+    int btn_x = cx + (cw - btn_w) / 2;
+    gfx_fill(btn_x, btn_y, btn_w, btn_h, btn_bg);
+    gfx_rect(btn_x, btn_y, btn_w, btn_h, C_WHITE);
+    gfx_str(btn_x + 8, btn_y + 3,
+            can_run ? "  RUN APP " : " SELECT.. ", C_WHITE, btn_bg);
+
+    /* hint text */
+    gfx_str(cx, btn_y + 3, can_run ? app_catalog[apps_selected].display_name : "",
+            rgb_to_pal(80,80,100), C_WINBG);
+}
+
+static void apps_run_selected() {
+    if(apps_selected < 0 || apps_selected >= APP_COUNT) return;
+    File *f = fs_find(app_catalog[apps_selected].filename);
+    open_terminal();
+    /* Clear terminal output */
+    for(int i = 0; i < TERM_ROWS; i++) memset(tw_lines[i], 0, TERM_COLS + 1);
+    tw_row = 0; tw_col = 0;
+    if(f) {
+        tw_print(app_catalog[apps_selected].display_name);
+        tw_print("\n");
+        pipe_clear(); pipe_mode = true;
+        run_c_script(f->content);
+        pipe_mode = false;
+        tw_print(pipe_buf);
+    } else {
+        tw_print("Error: file not found: ");
+        tw_print(app_catalog[apps_selected].filename);
+        tw_print("\n");
+    }
+    wm_needs_redraw = true;
+}
+
+void apps_click(int id, int lx, int ly) {
+    Window *w = &wins[id];
+    int cw = w->w - BORDER * 2;
+
+    /* ── Scrollbar strip (rightmost 14px) ── */
+    int sb_x  = cw - 14;
+    int sb_y0 = 12;                        /* below header */
+    int sb_h  = APP_VISIBLE * APP_ROW_H;
+
+    if(lx >= sb_x) {
+        /* Up arrow */
+        if(ly >= sb_y0 && ly < sb_y0 + 13) {
+            if(apps_scroll > 0) { apps_scroll--; wm_needs_redraw = true; }
+        }
+        /* Down arrow */
+        else if(ly >= sb_y0 + sb_h - 13 && ly < sb_y0 + sb_h) {
+            if(apps_scroll + APP_VISIBLE < APP_COUNT) { apps_scroll++; wm_needs_redraw = true; }
+        }
+        /* Thumb track — jump to proportional position */
+        else if(ly >= sb_y0 + 13 && ly < sb_y0 + sb_h - 13) {
+            int track_h = sb_h - 26;
+            int new_scroll = (ly - sb_y0 - 13) * APP_COUNT / track_h - APP_VISIBLE / 2;
+            if(new_scroll < 0) new_scroll = 0;
+            if(new_scroll + APP_VISIBLE > APP_COUNT) new_scroll = APP_COUNT - APP_VISIBLE;
+            apps_scroll = new_scroll;
+            wm_needs_redraw = true;
+        }
+        return;
+    }
+
+    /* ── Row list ── */
+    int list_rel = ly - 12;
+    if(list_rel >= 0 && list_rel < APP_VISIBLE * APP_ROW_H) {
+        int row = list_rel / APP_ROW_H + apps_scroll;
+        if(row >= 0 && row < APP_COUNT) {
+            if(apps_selected == row) {
+                apps_run_selected();   /* second click on same row = run */
+            } else {
+                apps_selected = row;
+                wm_needs_redraw = true;
+            }
+        }
+        return;
+    }
+
+    /* ── Run button ── */
+    int btn_y  = 12 + APP_VISIBLE * APP_ROW_H + 3;
+    int btn_w  = 64, btn_h = 13;
+    int btn_x0 = (cw - btn_w) / 2;
+    if(ly >= btn_y && ly < btn_y + btn_h && lx >= btn_x0 && lx < btn_x0 + btn_w) {
+        apps_run_selected();
+    }
+}
+
+void apps_key(int id, char k) {
+    UNUSED(id);
+    uint8_t uk = (uint8_t)k;
+
+    if(uk == KEY_UP) {
+        if(apps_selected > 0) apps_selected--;
+        else if(apps_scroll > 0) { apps_scroll--; apps_selected = apps_scroll; }
+        /* Keep selection visible */
+        if(apps_selected < apps_scroll) apps_scroll = apps_selected;
+        wm_needs_redraw = true;
+
+    } else if(uk == KEY_DOWN) {
+        if(apps_selected < APP_COUNT - 1) apps_selected++;
+        else apps_selected = APP_COUNT - 1;
+        /* Keep selection visible */
+        if(apps_selected >= apps_scroll + APP_VISIBLE)
+            apps_scroll = apps_selected - APP_VISIBLE + 1;
+        wm_needs_redraw = true;
+
+    } else if(uk == KEY_PGUP) {
+        apps_scroll -= APP_VISIBLE;
+        if(apps_scroll < 0) apps_scroll = 0;
+        apps_selected = apps_scroll;
+        wm_needs_redraw = true;
+
+    } else if(uk == KEY_PGDN) {
+        apps_scroll += APP_VISIBLE;
+        if(apps_scroll + APP_VISIBLE > APP_COUNT)
+            apps_scroll = APP_COUNT - APP_VISIBLE;
+        if(apps_scroll < 0) apps_scroll = 0;
+        apps_selected = apps_scroll;
+        wm_needs_redraw = true;
+
+    } else if(uk == KEY_HOME) {
+        apps_scroll = 0; apps_selected = 0;
+        wm_needs_redraw = true;
+
+    } else if(uk == KEY_END) {
+        apps_selected = APP_COUNT - 1;
+        apps_scroll = APP_COUNT - APP_VISIBLE;
+        if(apps_scroll < 0) apps_scroll = 0;
+        wm_needs_redraw = true;
+
+    } else if(k == '\n' || k == ' ') {
+        apps_run_selected();
+    }
+}
+
+void open_apps() {
+    if(apps_win >= 0 && wins[apps_win].active) {
+        win_focus = apps_win;
+        wm_needs_redraw = true;
+        return;
+    }
+    apps_scroll = 0; apps_selected = -1;
+    /* Window: 270 wide, header+8 rows+scroll+button+padding */
+    int wh = 12 + APP_VISIBLE * APP_ROW_H + 10 + 14 + TITLE_H + BORDER * 2 + 4;
+    apps_win = wm_open("App Launcher", 25, 12, 270, wh,
+                       apps_draw, apps_click, apps_key,
+                       rgb_to_pal(20, 50, 150));
+}
+
 /* ===== ABOUT WINDOW ===== */
 static int about_win=-1;
 
@@ -3032,6 +4170,334 @@ void open_sysmon() {
     sysmon_win=wm_open("System Monitor",5,5,150,100,sysmon_draw,sysmon_click,sysmon_key,C_DKGREEN);
 }
 
+/* ===== TEXT EDITOR WINDOW ===== */
+/*
+ * A full-screen-style windowed text editor.
+ * - Displays file content with line numbers
+ * - Keyboard input: type, backspace, enter
+ * - TAB = save current buffer to file
+ * - ESC = discard and close
+ * - Ctrl+N = new file prompt (enter filename in input bar first)
+ * - Scrolls vertically when content exceeds visible area
+ */
+
+#define ED_COLS     34      /* visible character columns */
+#define ED_ROWS     10      /* visible text rows          */
+#define ED_BUFSZ    FILE_SIZE
+
+static int   ed_win     = -1;
+static char  ed_buf[ED_BUFSZ];   /* editing buffer            */
+static int   ed_len     = 0;     /* current content length    */
+static int   ed_cursor  = 0;     /* cursor position in buf    */
+static int   ed_scroll  = 0;     /* top visible row index     */
+static char  ed_filename[32];    /* currently open filename   */
+static bool  ed_modified = false;
+
+/* --- filename prompt bar state --- */
+static char  ed_fname_input[32];
+static int   ed_fname_len = 0;
+static bool  ed_fname_mode = false; /* true = prompting for filename */
+
+/* Count which row (0-based) and column the cursor is on */
+static void ed_cursor_pos(int *out_row, int *out_col) {
+    int row = 0, col = 0;
+    for(int i = 0; i < ed_cursor && i < ed_len; i++) {
+        if(ed_buf[i] == '\n') { row++; col = 0; }
+        else col++;
+    }
+    *out_row = row; *out_col = col;
+}
+
+/* Return pointer to start of line number `line` in ed_buf */
+static char *ed_line_start(int line) {
+    char *p = ed_buf;
+    for(int l = 0; l < line && *p; p++) {
+        if(*p == '\n') l++;
+    }
+    return p;
+}
+
+/* Count total lines in buffer */
+static int ed_total_lines() {
+    int n = 1;
+    for(int i = 0; i < ed_len; i++) if(ed_buf[i] == '\n') n++;
+    return n;
+}
+
+void ed_draw(int id) {
+    Window *w = &wins[id];
+    int cx = w->x + BORDER;
+    int cy = w->y + BORDER + TITLE_H;
+    int cw = w->w - BORDER * 2;
+    int ch = w->h - TITLE_H;
+
+    /* Background */
+    gfx_fill(cx, cy, cw, ch, C_BLACK);
+
+    /* ---- Toolbar ---- */
+    int toolbar_h = 10;
+    gfx_fill(cx, cy, cw, toolbar_h, rgb_to_pal(30, 30, 70));
+    /* Filename */
+    gfx_str_clip(cx + 2, cy + 1, cw - 60, ed_filename[0] ? ed_filename : "(untitled)",
+                 rgb_to_pal(180, 220, 255), rgb_to_pal(30, 30, 70));
+    /* Modified indicator */
+    if(ed_modified)
+        gfx_str(cx + cw - 24, cy + 1, "*MOD", rgb_to_pal(255, 200, 0), rgb_to_pal(30, 30, 70));
+    /* Shortcut hints */
+    int hint_y = cy + ch - 9;
+    gfx_fill(cx, hint_y, cw, 9, rgb_to_pal(20, 20, 50));
+    gfx_str(cx + 1, hint_y + 1, "TAB=Save  ESC=Close",
+            rgb_to_pal(120, 140, 200), rgb_to_pal(20, 20, 50));
+
+    /* ---- Text area ---- */
+    int text_y = cy + toolbar_h;
+    int text_h = ch - toolbar_h - 9;  /* minus toolbar and hint bar */
+    int vis_rows = text_h / 9;
+
+    /* Compute cursor row/col for scroll adjustment */
+    int cur_row, cur_col;
+    ed_cursor_pos(&cur_row, &cur_col);
+
+    /* Auto-scroll: keep cursor visible */
+    if(cur_row < ed_scroll) ed_scroll = cur_row;
+    if(cur_row >= ed_scroll + vis_rows) ed_scroll = cur_row - vis_rows + 1;
+    if(ed_scroll < 0) ed_scroll = 0;
+
+    /* Draw lines */
+    for(int r = 0; r < vis_rows; r++) {
+        int line_num = ed_scroll + r;
+        int ry = text_y + r * 9;
+
+        /* Line number gutter (3 chars wide) */
+        uint8_t gutter_bg = rgb_to_pal(20, 20, 40);
+        gfx_fill(cx, ry, 20, 9, gutter_bg);
+        char lnbuf[5]; itoa(line_num + 1, lnbuf);
+        gfx_str(cx + 1, ry + 1, lnbuf, rgb_to_pal(80, 80, 120), gutter_bg);
+
+        /* Content area */
+        char *lp = ed_line_start(line_num);
+        if(!lp || *lp == '\0') {
+            gfx_fill(cx + 20, ry, cw - 20, 9, C_BLACK);
+            continue;
+        }
+        gfx_fill(cx + 20, ry, cw - 20, 9, C_BLACK);
+
+        /* Draw characters on this line */
+        int col = 0;
+        char *p = lp;
+        while(*p && *p != '\n' && col < ED_COLS) {
+            int px = cx + 20 + col * 8;
+            /* Cursor highlight */
+            int char_idx = (int)(p - ed_buf);
+            uint8_t fg = rgb_to_pal(200, 230, 200);
+            uint8_t bg = C_BLACK;
+            if(char_idx == ed_cursor) {
+                fg = C_BLACK;
+                bg = rgb_to_pal(0, 200, 80); /* cursor highlight */
+            }
+            gfx_char(px, ry + 1, *p, fg, bg);
+            col++;
+            p++;
+        }
+        /* Draw cursor at end of line if it's here */
+        if(line_num == cur_row && (lp + cur_col) >= p) {
+            int px = cx + 20 + col * 8;
+            if(px < cx + cw - 8)
+                gfx_fill(px, ry + 1, 2, 7, rgb_to_pal(0, 200, 80));
+        }
+    }
+
+    /* ---- Filename prompt overlay ---- */
+    if(ed_fname_mode) {
+        int py = text_y + (vis_rows / 2) * 9 - 10;
+        gfx_fill(cx + 10, py, cw - 20, 20, rgb_to_pal(40, 40, 100));
+        gfx_rect(cx + 10, py, cw - 20, 20, rgb_to_pal(100, 140, 255));
+        gfx_str(cx + 12, py + 2, "Open file:", rgb_to_pal(180, 200, 255), rgb_to_pal(40, 40, 100));
+        gfx_str(cx + 12, py + 11, ed_fname_input, C_WHITE, rgb_to_pal(40, 40, 100));
+        /* cursor */
+        gfx_fill(cx + 12 + ed_fname_len * 8, py + 11, 2, 7, C_WHITE);
+    }
+}
+
+void ed_key(int id, char k) {
+    UNUSED(id);
+
+    /* Filename prompt mode */
+    if(ed_fname_mode) {
+        if(k == '\n') {
+            ed_fname_input[ed_fname_len] = '\0';
+            /* Try to open the file */
+            File *f = fs_find(ed_fname_input);
+            if(f) {
+                strncpy(ed_filename, ed_fname_input, 32);
+                strncpy(ed_buf, f->content, ED_BUFSZ - 1);
+                ed_buf[ED_BUFSZ - 1] = '\0';
+                ed_len = strlen(ed_buf);
+            } else {
+                /* Create new file */
+                strncpy(ed_filename, ed_fname_input, 32);
+                ed_buf[0] = '\0';
+                ed_len = 0;
+            }
+            ed_cursor = 0;
+            ed_scroll = 0;
+            ed_modified = false;
+            ed_fname_mode = false;
+            ed_fname_input[0] = '\0';
+            ed_fname_len = 0;
+        } else if(k == 27) {
+            ed_fname_mode = false;
+            ed_fname_input[0] = '\0';
+            ed_fname_len = 0;
+        } else if(k == '\b') {
+            if(ed_fname_len > 0) { ed_fname_len--; ed_fname_input[ed_fname_len] = '\0'; }
+        } else if(k >= ' ' && k <= '~' && ed_fname_len < 30) {
+            ed_fname_input[ed_fname_len++] = k;
+            ed_fname_input[ed_fname_len] = '\0';
+        }
+        wm_needs_redraw = true;
+        return;
+    }
+
+    if(k == 27) {
+        /* ESC: close editor */
+        wm_close(id);
+        wm_needs_redraw = true;
+        return;
+    }
+
+    if(k == '\t') {
+        /* TAB: save file */
+        if(ed_filename[0] == '\0') {
+            /* No filename yet — open prompt */
+            ed_fname_mode = true;
+            ed_fname_input[0] = '\0';
+            ed_fname_len = 0;
+            wm_needs_redraw = true;
+            return;
+        }
+        File *f = fs_find(ed_filename);
+        if(!f) f = fs_create(ed_filename, NULL);
+        if(f) { fs_write(f, ed_buf); ed_modified = false; }
+        wm_needs_redraw = true;
+        return;
+    }
+
+    /* Ctrl+O = open file prompt */
+    if(k == 15) { /* Ctrl+O */
+        ed_fname_mode = true;
+        ed_fname_input[0] = '\0';
+        ed_fname_len = 0;
+        wm_needs_redraw = true;
+        return;
+    }
+
+    /* Regular editing */
+    if(k == '\b') {
+        if(ed_cursor > 0) {
+            ed_cursor--;
+            for(int i = ed_cursor; i < ed_len; i++) ed_buf[i] = ed_buf[i + 1];
+            ed_len--;
+            ed_modified = true;
+        }
+    } else if(k == '\n') {
+        if(ed_len < ED_BUFSZ - 1) {
+            for(int i = ed_len; i > ed_cursor; i--) ed_buf[i] = ed_buf[i - 1];
+            ed_buf[ed_cursor] = '\n';
+            ed_cursor++;
+            ed_len++;
+            ed_buf[ed_len] = '\0';
+            ed_modified = true;
+        }
+    } else if(k >= 32 && k <= 126) {
+        if(ed_len < ED_BUFSZ - 1) {
+            for(int i = ed_len; i > ed_cursor; i--) ed_buf[i] = ed_buf[i - 1];
+            ed_buf[ed_cursor] = k;
+            ed_cursor++;
+            ed_len++;
+            ed_buf[ed_len] = '\0';
+            ed_modified = true;
+        }
+    }
+    wm_needs_redraw = true;
+}
+
+void ed_click(int id, int lx, int ly) {
+    Window *w = &wins[id];
+    int toolbar_h = 10;
+    int cw = w->w - BORDER * 2;
+    int text_y = toolbar_h;
+    int hint_h = 9;
+    int text_h = w->h - TITLE_H - toolbar_h - hint_h;
+    int vis_rows = text_h / 9;
+    UNUSED(cw);
+
+    if(ly < toolbar_h || ly >= toolbar_h + text_h) return;
+
+    int clicked_row = (ly - text_y) / 9 + ed_scroll;
+    int clicked_col = (lx - 20) / 8;
+    if(clicked_col < 0) clicked_col = 0;
+
+    /* Move cursor to clicked position */
+    char *lp = ed_line_start(clicked_row);
+    if(!lp) return;
+    int col = 0;
+    char *p = lp;
+    while(*p && *p != '\n' && col < clicked_col) { p++; col++; }
+    ed_cursor = (int)(p - ed_buf);
+    if(ed_cursor > ed_len) ed_cursor = ed_len;
+
+    UNUSED(vis_rows);
+    wm_needs_redraw = true;
+}
+
+void open_editor_with(const char *filename) {
+    /* Reuse existing window if open */
+    if(ed_win >= 0 && wins[ed_win].active) {
+        win_focus = ed_win;
+        wm_needs_redraw = true;
+        /* If a new filename was requested, load it */
+        if(filename && filename[0]) {
+            strncpy(ed_filename, filename, 32);
+            File *f = fs_find(filename);
+            if(f) {
+                strncpy(ed_buf, f->content, ED_BUFSZ - 1);
+                ed_buf[ED_BUFSZ - 1] = '\0';
+                ed_len = strlen(ed_buf);
+            } else {
+                ed_buf[0] = '\0'; ed_len = 0;
+            }
+            ed_cursor = 0; ed_scroll = 0; ed_modified = false;
+        }
+        return;
+    }
+    /* Fresh open */
+    if(filename && filename[0]) {
+        strncpy(ed_filename, filename, 32);
+        File *f = fs_find(filename);
+        if(f) {
+            strncpy(ed_buf, f->content, ED_BUFSZ - 1);
+            ed_buf[ED_BUFSZ - 1] = '\0';
+            ed_len = strlen(ed_buf);
+        } else {
+            ed_buf[0] = '\0'; ed_len = 0;
+        }
+    } else {
+        ed_filename[0] = '\0';
+        ed_buf[0] = '\0'; ed_len = 0;
+    }
+    ed_cursor = 0; ed_scroll = 0; ed_modified = false;
+    ed_fname_mode = false; ed_fname_input[0] = '\0'; ed_fname_len = 0;
+
+    /* Window: 300×140, centered-ish */
+    ed_win = wm_open("Text Editor", 15, 20, 300, 160,
+                     ed_draw, ed_click, ed_key, rgb_to_pal(60, 0, 120));
+}
+
+void open_editor() {
+    open_editor_with(NULL);
+}
+
 /* ───────────────────────────────────────────────────────────────────────────
    G8. GUI MAIN LOOP
    ─────────────────────────────────────────────────────────────────────────── */
@@ -3057,6 +4523,7 @@ void kernel_main_text();
 
 void gui_run() {
     gui_running = true;
+    gui_mode    = true;   /* suppress all VGA text-mode writes and blocking get_key */
 
     vga_write_regs();
     vga_set_palette(); 
@@ -3067,27 +4534,71 @@ void gui_run() {
     win_focus = -1;
     icon_count = 0;
 
-    /* Add Icons to the LEFT side (Standard) */
-    icon_add(10, 10, "Term",  C_DKGREEN,   open_terminal);
-    icon_add(10, 55, "Files", C_DKBLUE,    open_filemanager);
-    icon_add(10, 100,"Calc",  C_BROWN,     open_calculator);
-    icon_add(10, 145,"About", C_DKMAGENTA, open_about);
+    /* Icons: two columns so all 6 fit above the taskbar
+       Col 1 x=8:  Term / Files / Edit / Calc
+       Col 2 x=50: Apps                                  */
+    icon_add( 8,  8,  "Term",  C_DKGREEN,             open_terminal);
+    icon_add( 8, 52,  "Files", C_DKBLUE,              open_filemanager);
+    icon_add( 8, 96,  "Edit",  rgb_to_pal(60,0,120),  open_editor);
+    icon_add( 8, 140, "Calc",  C_BROWN,               open_calculator);
+    icon_add(50,  8,  "Apps",  rgb_to_pal(20,50,150), open_apps);
 
     while(gui_running) {
         mouse_poll();
 
-        if(inb(0x64) & 1) {
-        uint8_t sc = inb(0x60);
-        if(sc == 0x2A || sc == 0x36) shift_held = true;
-        else if(sc == 0xAA || sc == 0xB6) shift_held = false;
-        else if(sc == 0x1D) ctrl_held = true;
-        else if(sc == 0x9D) ctrl_held = false;
-        else if(!(sc & 0x80) && sc < 128) {
-        char c = shift_held ? keymap_hi[sc] : keymap_lo[sc];
-        if(c == 27) { gui_running = false; }
-        else if(c) wm_handle_key(c);
-    }
-}
+        /* Drain all pending keyboard scancodes this frame */
+        static bool gui_ext = false;   /* saw 0xE0 prefix last byte */
+        while(1) {
+            uint8_t stat = inb(0x64);
+            if(!(stat & 0x01)) break;   /* no data */
+            if(stat & 0x20)  break;     /* it's mouse data, leave for mouse_poll */
+            uint8_t sc = inb(0x60);
+
+            /* Extended prefix — remember it, read the next byte next iteration */
+            if(sc == 0xE0) { gui_ext = true; continue; }
+
+            /* Track modifier key make/break (non-extended) */
+            if(!gui_ext) {
+                if(sc == 0x2A || sc == 0x36)  { shift_held = true;  continue; }
+                if(sc == 0xAA || sc == 0xB6)  { shift_held = false; continue; }
+                if(sc == 0x1D)                { ctrl_held  = true;  continue; }
+                if(sc == 0x9D)                { ctrl_held  = false; continue; }
+            }
+
+            bool released = (sc & 0x80) != 0;
+            uint8_t code  = sc & 0x7F;
+
+            if(gui_ext) {
+                gui_ext = false;
+                /* Extended key releases — only track ctrl (right ctrl = 0x1D ext) */
+                if(released) {
+                    if(code == 0x1D) ctrl_held = false;
+                    continue;
+                }
+                /* Map arrow / nav scancodes to our KEY_* sentinel chars */
+                char nav = 0;
+                if(code == 0x48) nav = (char)KEY_UP;
+                else if(code == 0x50) nav = (char)KEY_DOWN;
+                else if(code == 0x4B) nav = (char)KEY_LEFT;
+                else if(code == 0x4D) nav = (char)KEY_RIGHT;
+                else if(code == 0x47) nav = (char)KEY_HOME;
+                else if(code == 0x4F) nav = (char)KEY_END;
+                else if(code == 0x49) nav = (char)KEY_PGUP;
+                else if(code == 0x51) nav = (char)KEY_PGDN;
+                else if(code == 0x53) nav = (char)KEY_DEL;
+                if(nav) wm_handle_key(nav);
+                continue;
+            }
+
+            if(released) continue;  /* ignore key releases for normal keys */
+
+            if(code < 128) {
+                char c = shift_held ? keymap_hi[code] : keymap_lo[code];
+                if(ctrl_held && c >= 'a' && c <= 'z') c = c - 'a' + 1;
+                if(c == 27) { gui_running = false; break; }
+                else if(c) wm_handle_key(c);
+            }
+        }
         
         /* App Opening Logic */
         if(mouse_clicked && wm_hit(mouse_x, mouse_y) < 0) {
@@ -3106,7 +4617,7 @@ void gui_run() {
         for(volatile int i=0; i<1500; i++);
     }
 
-    cmd_reboot();
+    cmd_reboot();  /* unreachable — gui_running never set false except by ESC */
 }
 /* THE ABSOLUTE END OF THE FILE */
 void kernel_main() {
